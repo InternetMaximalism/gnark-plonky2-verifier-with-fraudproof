@@ -82,6 +82,26 @@ func (p *PlonkChip) evalL0(x gl.QuadraticExtensionVariable, xPowN gl.QuadraticEx
 	return quotient
 }
 
+// evalL0WithFlag is like evalL0 but returns a flag instead of asserting.
+func (p *PlonkChip) evalL0WithFlag(x gl.QuadraticExtensionVariable, xPowN gl.QuadraticExtensionVariable) (gl.QuadraticExtensionVariable, frontend.Variable) {
+	glApi := gl.New(p.api)
+	evalZeroPoly := glApi.SubExtension(
+		xPowN,
+		gl.OneExtension(),
+	)
+	denominator := glApi.SubExtension(
+		glApi.ScalarMulExtension(x, p.DEGREE),
+		p.DEGREE_QE,
+	)
+
+	quotient, hasQuotient := glApi.DivExtensionWithFlag(
+		evalZeroPoly,
+		denominator,
+	)
+
+	return quotient, hasQuotient
+}
+
 func (p *PlonkChip) checkPartialProducts(
 	numerators []gl.QuadraticExtensionVariable,
 	denominators []gl.QuadraticExtensionVariable,
@@ -247,4 +267,134 @@ func (p *PlonkChip) Verify(
 
 		glApi.AssertIsEqualExtension(vanishingPolysZeta[i], prod)
 	}
+}
+
+// VerifyAndReturnResult performs the same checks as Verify but returns 1 if all checks pass, 0 otherwise.
+// No assertions are made; the circuit remains satisfiable regardless of the proof's validity.
+func (p *PlonkChip) VerifyAndReturnResult(
+	proofChallenges variables.ProofChallenges,
+	openings variables.OpeningSet,
+	publicInputsHash poseidon.GoldilocksHashOut,
+) frontend.Variable {
+	glApi := gl.New(p.api)
+	allPass := frontend.Variable(1)
+
+	// Calculate zeta^n
+	zetaPowN := p.expPowerOf2Extension(proofChallenges.PlonkZeta)
+
+	localConstants := openings.Constants
+	localWires := openings.Wires
+	vars := gates.NewEvaluationVars(
+		localConstants,
+		localWires,
+		publicInputsHash,
+	)
+
+	// Use evalVanishingPolyWithFlag which uses the soft L0 evaluation
+	vanishingPolysZeta, l0Check := p.evalVanishingPolyWithFlag(*vars, proofChallenges, openings, zetaPowN)
+	allPass = p.api.And(allPass, l0Check)
+
+	// Calculate Z(H)
+	zHZeta := glApi.SubExtension(zetaPowN, gl.OneExtension())
+
+	for i := 0; i < len(vanishingPolysZeta); i++ {
+		quotientPolysStartIdx := i * int(p.commonData.QuotientDegreeFactor)
+		quotientPolysEndIdx := quotientPolysStartIdx + int(p.commonData.QuotientDegreeFactor)
+		prod := glApi.MulExtension(
+			zHZeta,
+			glApi.ReduceWithPowers(
+				openings.QuotientPolys[quotientPolysStartIdx:quotientPolysEndIdx],
+				zetaPowN,
+			),
+		)
+
+		check := glApi.IsEqualExtension(vanishingPolysZeta[i], prod)
+		allPass = p.api.And(allPass, check)
+	}
+
+	return allPass
+}
+
+// evalVanishingPolyWithFlag is like evalVanishingPoly but uses the soft L0 evaluation.
+// Returns the vanishing polynomial evaluations and a flag indicating if L0 division succeeded.
+func (p *PlonkChip) evalVanishingPolyWithFlag(
+	vars gates.EvaluationVars,
+	proofChallenges variables.ProofChallenges,
+	openings variables.OpeningSet,
+	zetaPowN gl.QuadraticExtensionVariable,
+) ([]gl.QuadraticExtensionVariable, frontend.Variable) {
+	glApi := gl.New(p.api)
+	constraintTerms := p.evaluateGatesChip.EvaluateGateConstraints(vars)
+
+	sIDs := make([]gl.QuadraticExtensionVariable, p.commonData.Config.NumRoutedWires)
+	for i := uint64(0); i < p.commonData.Config.NumRoutedWires; i++ {
+		sIDs[i] = glApi.ScalarMulExtension(proofChallenges.PlonkZeta, p.commonDataKIs[i])
+	}
+
+	// Calculate L_0(zeta) with flag
+	l0Zeta, l0Check := p.evalL0WithFlag(proofChallenges.PlonkZeta, zetaPowN)
+
+	vanishingZ1Terms := make([]gl.QuadraticExtensionVariable, 0, p.commonData.Config.NumChallenges)
+	vanishingPartialProductsTerms := make([]gl.QuadraticExtensionVariable, 0, p.commonData.Config.NumChallenges*p.commonData.NumPartialProducts)
+	for i := uint64(0); i < p.commonData.Config.NumChallenges; i++ {
+		z1_term := glApi.MulExtension(
+			l0Zeta,
+			glApi.SubExtension(openings.PlonkZs[i], gl.OneExtension()))
+		vanishingZ1Terms = append(vanishingZ1Terms, z1_term)
+
+		numeratorValues := make([]gl.QuadraticExtensionVariable, 0, p.commonData.Config.NumRoutedWires)
+		denominatorValues := make([]gl.QuadraticExtensionVariable, 0, p.commonData.Config.NumRoutedWires)
+		for j := uint64(0); j < p.commonData.Config.NumRoutedWires; j++ {
+			wireValuePlusGamma := glApi.AddExtension(
+				openings.Wires[j],
+				gl.NewQuadraticExtensionVariable(proofChallenges.PlonkGammas[i], gl.Zero()),
+			)
+
+			numerator := glApi.AddExtension(
+				glApi.MulExtension(
+					gl.NewQuadraticExtensionVariable(proofChallenges.PlonkBetas[i], gl.Zero()),
+					sIDs[j],
+				),
+				wireValuePlusGamma,
+			)
+
+			denominator := glApi.AddExtension(
+				glApi.MulExtension(
+					gl.NewQuadraticExtensionVariable(proofChallenges.PlonkBetas[i], gl.Zero()),
+					openings.PlonkSigmas[j],
+				),
+				wireValuePlusGamma,
+			)
+
+			numeratorValues = append(numeratorValues, numerator)
+			denominatorValues = append(denominatorValues, denominator)
+		}
+
+		vanishingPartialProductsTerms = append(
+			vanishingPartialProductsTerms,
+			p.checkPartialProducts(numeratorValues, denominatorValues, i, openings)...,
+		)
+	}
+
+	vanishingTerms := append(vanishingZ1Terms, vanishingPartialProductsTerms...)
+	vanishingTerms = append(vanishingTerms, constraintTerms...)
+
+	reducedValues := make([]gl.QuadraticExtensionVariable, p.commonData.Config.NumChallenges)
+	for i := uint64(0); i < p.commonData.Config.NumChallenges; i++ {
+		reducedValues[i] = gl.ZeroExtension()
+	}
+
+	for i := len(vanishingTerms) - 1; i >= 0; i-- {
+		for j := uint64(0); j < p.commonData.Config.NumChallenges; j++ {
+			reducedValues[j] = glApi.AddExtension(
+				vanishingTerms[i],
+				glApi.ScalarMulExtension(
+					reducedValues[j],
+					proofChallenges.PlonkAlphas[j],
+				),
+			)
+		}
+	}
+
+	return reducedValues, l0Check
 }

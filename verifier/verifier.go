@@ -168,3 +168,36 @@ func (c *VerifierChip) Verify(
 		&proof.OpeningProof,
 	)
 }
+
+// VerifyAndReturnResult performs the same verification as Verify but returns 1 if all checks
+// pass and 0 if any check fails. No assertions are made for proof validity, so the circuit
+// remains satisfiable regardless of the proof's validity. This enables fraud proof generation.
+func (c *VerifierChip) VerifyAndReturnResult(
+	proof variables.Proof,
+	publicInputs []gl.Variable,
+	verifierData variables.VerifierOnlyCircuitData,
+) frontend.Variable {
+	c.rangeCheckProof(proof)
+
+	publicInputsHash := c.GetPublicInputsHash(publicInputs)
+	proofChallenges := c.GetChallenges(proof, publicInputsHash, verifierData)
+
+	plonkResult := c.plonkChip.VerifyAndReturnResult(proofChallenges, proof.Openings, publicInputsHash)
+
+	initialMerkleCaps := []variables.FriMerkleCap{
+		verifierData.ConstantSigmasCap,
+		proof.WiresCap,
+		proof.PlonkZsPartialProductsCap,
+		proof.QuotientPolysCap,
+	}
+
+	friResult := c.friChip.VerifyFriProofAndReturnResult(
+		c.friChip.GetInstance(proofChallenges.PlonkZeta),
+		c.friChip.ToOpenings(proof.Openings),
+		&proofChallenges.FriChallenges,
+		initialMerkleCaps,
+		&proof.OpeningProof,
+	)
+
+	return c.api.And(plonkResult, friResult)
+}

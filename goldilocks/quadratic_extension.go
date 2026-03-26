@@ -229,6 +229,38 @@ func (p *Chip) AssertIsEqualExtension(
 	p.AssertIsEqual(a[1], b[1])
 }
 
+// IsEqualExtension returns 1 if a == b, 0 otherwise (no assertion).
+func (p *Chip) IsEqualExtension(
+	a QuadraticExtensionVariable,
+	b QuadraticExtensionVariable,
+) frontend.Variable {
+	eq0 := p.IsEqual(a[0], b[0])
+	eq1 := p.IsEqual(a[1], b[1])
+	return p.api.And(eq0, eq1)
+}
+
+// InverseExtensionWithFlag computes the inverse without asserting non-zero.
+// Returns (inverse, hasInv) where hasInv is 1 if the inverse exists, 0 otherwise.
+// When the input is zero, the returned inverse is arbitrary but the circuit remains satisfiable.
+func (p *Chip) InverseExtensionWithFlag(a QuadraticExtensionVariable) (QuadraticExtensionVariable, frontend.Variable) {
+	// Same logic as InverseExtension but without the non-zero assertion.
+	aPowRMinus1 := QuadraticExtensionVariable{
+		a[0],
+		p.Mul(a[1], NewVariable(DTH_ROOT)),
+	}
+	aPowR := p.MulExtension(aPowRMinus1, a)
+
+	aPowRInv, hasInv := p.Inverse(aPowR[0])
+	return p.ScalarMulExtension(aPowRMinus1, aPowRInv), hasInv
+}
+
+// DivExtensionWithFlag divides a by b without asserting b is non-zero.
+// Returns (quotient, hasInv) where hasInv is 1 if b is invertible, 0 otherwise.
+func (p *Chip) DivExtensionWithFlag(a, b QuadraticExtensionVariable) (QuadraticExtensionVariable, frontend.Variable) {
+	bInv, hasInv := p.InverseExtensionWithFlag(b)
+	return p.MulExtension(a, bInv), hasInv
+}
+
 func (p *Chip) RangeCheckQE(a QuadraticExtensionVariable) {
 	p.RangeCheck(a[0])
 	p.RangeCheck(a[1])
