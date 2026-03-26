@@ -408,6 +408,11 @@ func (p *Chip) AssertIsEqual(x, y Variable) {
 	p.api.AssertIsEqual(x.Limb, y.Limb)
 }
 
+// IsEqual returns 1 if x == y, 0 otherwise (no assertion).
+func (p *Chip) IsEqual(x, y Variable) frontend.Variable {
+	return p.api.IsZero(p.api.Sub(x.Limb, y.Limb))
+}
+
 func (p *Chip) rangeCheckerCheck(x frontend.Variable, nbBits int) {
 	switch p.rangeCheckerType {
 	case NATIVE_RANGE_CHECKER:

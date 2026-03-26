@@ -546,3 +546,353 @@ func (f *Chip) VerifyFriProof(
 		)
 	}
 }
+
+// VerifyFriProofAndReturnResult performs the same FRI verification as VerifyFriProof but returns
+// 1 if all checks pass, 0 otherwise. No assertions are made for proof validity checks.
+func (f *Chip) VerifyFriProofAndReturnResult(
+	instance InstanceInfo,
+	openings Openings,
+	friChallenges *variables.FriChallenges,
+	initialMerkleCaps []variables.FriMerkleCap,
+	friProof *variables.FriProof,
+) frontend.Variable {
+	validateFriProofShape(friProof, instance, f.friParams)
+
+	// POW check still uses assertLeadingZeros (range check, not a proof validity check)
+	f.assertLeadingZeros(friChallenges.FriPowResponse, f.friParams.Config)
+
+	if int(f.friParams.Config.NumQueryRounds) != len(friProof.QueryRoundProofs) {
+		panic("Number of query rounds does not match config.")
+	}
+
+	precomputedReducedEvals := f.fromOpeningsAndAlpha(&openings, friChallenges.FriAlpha)
+
+	nLog := f.friParams.DegreeBits + f.friParams.Config.RateBits
+	n := uint64(math.Pow(2, float64(nLog)))
+
+	if len(friChallenges.FriQueryIndices) != len(friProof.QueryRoundProofs) {
+		panic(fmt.Sprintf(
+			"Number of query indices (%d) should equal number of query round proofs (%d)",
+			len(friChallenges.FriQueryIndices),
+			len(friProof.QueryRoundProofs),
+		))
+	}
+
+	allPass := frontend.Variable(1)
+	for idx, xIndex := range friChallenges.FriQueryIndices {
+		roundProof := friProof.QueryRoundProofs[idx]
+
+		roundCheck := f.verifyQueryRoundAndReturnResult(
+			instance,
+			friChallenges,
+			precomputedReducedEvals,
+			initialMerkleCaps,
+			friProof,
+			xIndex,
+			n,
+			nLog,
+			&roundProof,
+		)
+		allPass = f.api.And(allPass, roundCheck)
+	}
+
+	return allPass
+}
+
+// verifyMerkleProofToCapWithCapIndexAndReturnResult is like verifyMerkleProofToCapWithCapIndex
+// but returns 1 if the proof is valid, 0 otherwise.
+func (f *Chip) verifyMerkleProofToCapWithCapIndexAndReturnResult(
+	leafData []gl.Variable,
+	leafIndexBits []frontend.Variable,
+	capIndexBits []frontend.Variable,
+	merkleCap variables.FriMerkleCap,
+	proof *variables.FriMerkleProof,
+) frontend.Variable {
+	currentDigest := f.poseidonBN254Chip.HashOrNoop(leafData)
+	for i, sibling := range proof.Siblings {
+		bit := leafIndexBits[i]
+
+		var inputs poseidon.BN254State
+		inputs[0] = frontend.Variable(0)
+		inputs[1] = frontend.Variable(0)
+		inputs[2] = f.api.Select(bit, sibling, currentDigest)
+		inputs[3] = f.api.Select(bit, currentDigest, sibling)
+		state := f.poseidonBN254Chip.Poseidon(inputs)
+
+		currentDigest = state[0]
+	}
+
+	if len(capIndexBits) != 4 || len(merkleCap) != 16 {
+		errorMsg, _ := fmt.Printf(
+			"capIndexBits length should be 4 and the merkleCap length should be 16.  Actual values (capIndexBits: %d, merkleCap: %d)\n",
+			len(capIndexBits),
+			len(merkleCap),
+		)
+		panic(errorMsg)
+	}
+
+	const NUM_LEAF_LOOKUPS = 4
+	const STRIDE_LENGTH = 4
+	var leafLookups [NUM_LEAF_LOOKUPS]poseidon.BN254HashOut
+	for i := 0; i < NUM_LEAF_LOOKUPS; i++ {
+		leafLookups[i] = f.api.Lookup2(
+			capIndexBits[0], capIndexBits[1],
+			merkleCap[i*STRIDE_LENGTH], merkleCap[i*STRIDE_LENGTH+1], merkleCap[i*STRIDE_LENGTH+2], merkleCap[i*STRIDE_LENGTH+3],
+		)
+	}
+
+	merkleCapEntry := f.api.Lookup2(capIndexBits[2], capIndexBits[3], leafLookups[0], leafLookups[1], leafLookups[2], leafLookups[3])
+	return f.api.IsZero(f.api.Sub(currentDigest, merkleCapEntry))
+}
+
+// verifyInitialProofAndReturnResult is like verifyInitialProof but returns a boolean result.
+func (f *Chip) verifyInitialProofAndReturnResult(
+	xIndexBits []frontend.Variable,
+	proof *variables.FriInitialTreeProof,
+	initialMerkleCaps []variables.FriMerkleCap,
+	capIndexBits []frontend.Variable,
+) frontend.Variable {
+	if len(proof.EvalsProofs) != len(initialMerkleCaps) {
+		panic("length of eval proofs in fri proof should equal length of initial merkle caps")
+	}
+
+	allPass := frontend.Variable(1)
+	for i := 0; i < len(initialMerkleCaps); i++ {
+		evals := proof.EvalsProofs[i].Elements
+		merkleProof := proof.EvalsProofs[i].MerkleProof
+		cap := initialMerkleCaps[i]
+		check := f.verifyMerkleProofToCapWithCapIndexAndReturnResult(evals, xIndexBits, capIndexBits, cap, &merkleProof)
+		allPass = f.api.And(allPass, check)
+	}
+	return allPass
+}
+
+// friCombineInitialWithFlag is like friCombineInitial but uses soft division (no assert on invertibility).
+// Returns the combined value and a flag indicating if all divisions succeeded.
+func (f *Chip) friCombineInitialWithFlag(
+	instance InstanceInfo,
+	proof variables.FriInitialTreeProof,
+	friAlpha gl.QuadraticExtensionVariable,
+	subgroupX_QE gl.QuadraticExtensionVariable,
+	precomputedReducedEval []gl.QuadraticExtensionVariable,
+) (gl.QuadraticExtensionVariable, frontend.Variable) {
+	sum := gl.ZeroExtension()
+	allInvertible := frontend.Variable(1)
+
+	if len(instance.Batches) != len(precomputedReducedEval) {
+		panic("len(openings) != len(precomputedReducedEval)")
+	}
+
+	for i := 0; i < len(instance.Batches); i++ {
+		batch := instance.Batches[i]
+		reducedOpenings := precomputedReducedEval[i]
+
+		point := batch.Point
+		evals := make([]gl.QuadraticExtensionVariable, 0)
+		for _, polynomial := range batch.Polynomials {
+			evals = append(
+				evals,
+				gl.QuadraticExtensionVariable{
+					proof.EvalsProofs[polynomial.OracleIndex].Elements[polynomial.PolynomialInfo],
+					gl.Zero(),
+				},
+			)
+		}
+
+		reducedEvals := f.gl.ReduceWithPowers(evals, friAlpha)
+		numerator := f.gl.SubExtensionNoReduce(reducedEvals, reducedOpenings)
+		denominator := f.gl.SubExtension(subgroupX_QE, point)
+		sum = f.gl.MulExtension(f.gl.ExpExtension(friAlpha, uint64(len(evals))), sum)
+		inv, hasInv := f.gl.InverseExtensionWithFlag(denominator)
+		allInvertible = f.api.And(allInvertible, hasInv)
+		sum = f.gl.MulAddExtension(
+			numerator,
+			inv,
+			sum,
+		)
+	}
+
+	return sum, allInvertible
+}
+
+// computeEvaluationWithFlag is like computeEvaluation but uses soft inversion for barycentric weights.
+func (f *Chip) computeEvaluationWithFlag(
+	x gl.Variable,
+	xIndexWithinCosetBits []frontend.Variable,
+	arityBits uint64,
+	evals []gl.QuadraticExtensionVariable,
+	beta gl.QuadraticExtensionVariable,
+) (gl.QuadraticExtensionVariable, frontend.Variable) {
+	arity := 1 << arityBits
+	if (len(evals)) != arity {
+		panic("len(evals) != arity")
+	}
+	if arityBits > 8 {
+		panic("currently assuming that arityBits is <= 8")
+	}
+
+	g := gl.PrimitiveRootOfUnity(arityBits)
+	gInv := goldilocks.NewElement(0)
+	gInv.Exp(g, big.NewInt(int64(arity-1)))
+
+	permutedEvals := make([]gl.QuadraticExtensionVariable, len(evals))
+	for i := uint8(0); i <= uint8(len(evals)-1); i++ {
+		newIndex := bits.Reverse8(i) >> (8 - arityBits)
+		permutedEvals[newIndex] = evals[i]
+	}
+
+	revXIndexWithinCosetBits := make([]frontend.Variable, len(xIndexWithinCosetBits))
+	for i := 0; i < len(xIndexWithinCosetBits); i++ {
+		revXIndexWithinCosetBits[len(xIndexWithinCosetBits)-1-i] = xIndexWithinCosetBits[i]
+	}
+	start := f.expFromBitsConstBase(gInv, revXIndexWithinCosetBits)
+	cosetStart := f.gl.Mul(start, x)
+
+	xPoints := make([]gl.QuadraticExtensionVariable, len(evals))
+	yPoints := permutedEvals
+
+	g_F := gl.NewVariable(g.Uint64()).ToQuadraticExtension()
+	xPoints[0] = gl.QuadraticExtensionVariable{cosetStart, gl.Zero()}
+	for i := 1; i < len(evals); i++ {
+		xPoints[i] = f.gl.MulExtension(xPoints[i-1], g_F)
+	}
+
+	allInvertible := frontend.Variable(1)
+	barycentricWeights := make([]gl.QuadraticExtensionVariable, len(xPoints))
+	for i := 0; i < len(xPoints); i++ {
+		barycentricWeights[i] = gl.OneExtension()
+		for j := 0; j < len(xPoints); j++ {
+			if i != j {
+				barycentricWeights[i] = f.gl.SubMulExtension(
+					xPoints[i],
+					xPoints[j],
+					barycentricWeights[i],
+				)
+			}
+		}
+		inv, hasInv := f.gl.InverseExtensionWithFlag(barycentricWeights[i])
+		allInvertible = f.api.And(allInvertible, hasInv)
+		barycentricWeights[i] = inv
+	}
+
+	return f.interpolate(beta, xPoints, yPoints, barycentricWeights), allInvertible
+}
+
+// verifyQueryRoundAndReturnResult is like verifyQueryRound but returns 1 if all checks pass, 0 otherwise.
+func (f *Chip) verifyQueryRoundAndReturnResult(
+	instance InstanceInfo,
+	challenges *variables.FriChallenges,
+	precomputedReducedEval []gl.QuadraticExtensionVariable,
+	initialMerkleCaps []variables.FriMerkleCap,
+	proof *variables.FriProof,
+	xIndex gl.Variable,
+	n uint64,
+	nLog uint64,
+	roundProof *variables.FriQueryRound,
+) frontend.Variable {
+	assertNoncanonicalIndicesOK(*f.friParams)
+
+	allPass := frontend.Variable(1)
+
+	xIndex = f.gl.Reduce(xIndex)
+	xIndexBits := f.api.ToBinary(xIndex.Limb, 64)[0 : f.friParams.DegreeBits+f.friParams.Config.RateBits]
+	capIndexBits := xIndexBits[len(xIndexBits)-int(f.friParams.Config.CapHeight):]
+
+	// Use soft Merkle proof verification for initial proof
+	initCheck := f.verifyInitialProofAndReturnResult(xIndexBits, &roundProof.InitialTreesProof, initialMerkleCaps, capIndexBits)
+	allPass = f.api.And(allPass, initCheck)
+
+	subgroupX := f.calculateSubgroupX(xIndexBits, nLog)
+	subgroupX_QE := subgroupX.ToQuadraticExtension()
+
+	oldEval, combineCheck := f.friCombineInitialWithFlag(
+		instance,
+		roundProof.InitialTreesProof,
+		challenges.FriAlpha,
+		subgroupX_QE,
+		precomputedReducedEval,
+	)
+	allPass = f.api.And(allPass, combineCheck)
+
+	for i, arityBits := range f.friParams.ReductionArityBits {
+		evals := roundProof.Steps[i].Evals
+
+		cosetIndexBits := xIndexBits[arityBits:]
+		xIndexWithinCosetBits := xIndexBits[:arityBits]
+
+		if arityBits != 4 {
+			panic("assuming arity bits is 4")
+		}
+
+		const NUM_LEAF_LOOKUPS = 4
+		var leafLookups [NUM_LEAF_LOOKUPS]gl.QuadraticExtensionVariable
+		for i := 0; i < NUM_LEAF_LOOKUPS; i++ {
+			leafLookups[i] = f.gl.Lookup2(
+				xIndexWithinCosetBits[0],
+				xIndexWithinCosetBits[1],
+				evals[i*NUM_LEAF_LOOKUPS],
+				evals[i*NUM_LEAF_LOOKUPS+1],
+				evals[i*NUM_LEAF_LOOKUPS+2],
+				evals[i*NUM_LEAF_LOOKUPS+3],
+			)
+		}
+
+		newEval := f.gl.Lookup2(
+			xIndexWithinCosetBits[2],
+			xIndexWithinCosetBits[3],
+			leafLookups[0],
+			leafLookups[1],
+			leafLookups[2],
+			leafLookups[3],
+		)
+
+		// Soft equality checks instead of assert
+		check0 := f.gl.IsEqual(newEval[0], oldEval[0])
+		check1 := f.gl.IsEqual(newEval[1], oldEval[1])
+		allPass = f.api.And(allPass, check0)
+		allPass = f.api.And(allPass, check1)
+
+		evalResult, evalCheck := f.computeEvaluationWithFlag(
+			subgroupX,
+			xIndexWithinCosetBits,
+			arityBits,
+			evals,
+			challenges.FriBetas[i],
+		)
+		oldEval = evalResult
+		allPass = f.api.And(allPass, evalCheck)
+
+		fieldEvals := make([]gl.Variable, 0, 2*len(evals))
+		for j := 0; j < len(evals); j++ {
+			fieldEvals = append(fieldEvals, evals[j][0])
+			fieldEvals = append(fieldEvals, evals[j][1])
+		}
+
+		// Soft Merkle proof verification for step
+		stepMerkleCheck := f.verifyMerkleProofToCapWithCapIndexAndReturnResult(
+			fieldEvals,
+			cosetIndexBits,
+			capIndexBits,
+			proof.CommitPhaseMerkleCaps[i],
+			&roundProof.Steps[i].MerkleProof,
+		)
+		allPass = f.api.And(allPass, stepMerkleCheck)
+
+		for j := uint64(0); j < arityBits; j++ {
+			subgroupX = f.gl.Mul(subgroupX, subgroupX)
+		}
+
+		xIndexBits = cosetIndexBits
+	}
+
+	subgroupX_QE = subgroupX.ToQuadraticExtension()
+	finalPolyEval := f.finalPolyEval(proof.FinalPoly, subgroupX_QE)
+
+	// Soft equality checks for final polynomial
+	finalCheck0 := f.gl.IsEqual(oldEval[0], finalPolyEval[0])
+	finalCheck1 := f.gl.IsEqual(oldEval[1], finalPolyEval[1])
+	allPass = f.api.And(allPass, finalCheck0)
+	allPass = f.api.And(allPass, finalCheck1)
+
+	return allPass
+}
